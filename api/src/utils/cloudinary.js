@@ -2,9 +2,9 @@ import cloudinary from "cloudinary";
 import fs from "fs";
 
 cloudinary.config({
-  cloud_name: "dcxu367zg",
-  api_key: "192186788824314",
-  api_secret: "dR_xSMM5OE_R_OA_zsCs49hYT98",
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
 const uploadImage = async (file) => {
