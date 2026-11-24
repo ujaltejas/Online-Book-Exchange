@@ -1,42 +1,43 @@
 import nodemailer from "nodemailer";
+import { env, isEmailConfigured } from "../config/env.js";
+import { ApiError } from "./ApiError.js";
 
-const requiredEmailEnv = ["EMAIL_HOST", "EMAIL_PORT", "EMAIL_USER", "EMAIL_PASSWORD"];
+let transporter;
 
-const validateEmailConfig = () => {
-  const missing = requiredEmailEnv.filter((key) => !process.env[key]);
-  if (missing.length > 0) {
-    throw new Error(`Missing email configuration: ${missing.join(", ")}`);
+const getTransporter = () => {
+  if (!isEmailConfigured()) {
+    throw new ApiError(503, "Email is not configured on this server.");
+  }
+  if (!transporter) {
+    const { host, port, user, pass } = env.EMAIL;
+    transporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      requireTLS: env.isProd && port !== 465,
+      auth: { user, pass },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 20_000,
+    });
+  }
+  return transporter;
+};
+
+/** Call once at startup to log whether SMTP credentials work. Never throws. */
+export const verifyMailer = async () => {
+  if (!isEmailConfigured()) return { ok: false, reason: "not configured" };
+  try {
+    await getTransporter().verify();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: err.message };
   }
 };
 
-const createTransporter = () => {
-  validateEmailConfig();
-
-  return nodemailer.createTransport({
-    host: process.env.EMAIL_HOST,
-    port: Number(process.env.EMAIL_PORT) || 587,
-    secure: Number(process.env.EMAIL_PORT) === 465,
-    auth: {
-      user: process.env.EMAIL_USER,
-      pass: process.env.EMAIL_PASSWORD,
-    },
-  });
-};
-
-export const sendEmail = async ({ to, subject, html, replyTo }) => {
-  if (!to || !subject || !html) {
-    throw new Error("Email receiver, subject and html body are required");
-  }
-
-  const transporter = createTransporter();
-
-  return transporter.sendMail({
-    from: '"Online Book Exchange" <noreply@bookexchange.local>',
-    to,
-    subject,
-    html,
-    replyTo,
-  });
+export const sendEmail = async ({ to, subject, html, text, replyTo }) => {
+  if (!to || !subject || !html || !text) throw new Error("to, subject, html and text are required");
+  return getTransporter().sendMail({ from: env.EMAIL.from, to, subject, html, text, replyTo });
 };
 
 export default sendEmail;

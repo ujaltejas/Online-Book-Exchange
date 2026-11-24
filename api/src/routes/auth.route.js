@@ -1,20 +1,15 @@
 import express from "express";
-import {
-  login,
-  logout,
-  register,
-  getUserProfile,
-  // checkEmai,
-} from "../controllers/auth.controller.js";
-import protect from "../middlewares/auth.middleware.js";
-import upload from "../middlewares/multer.js";
+import { login, logout, me, register, updateProfile } from "../controllers/auth.controller.js";
+import { protect } from "../middlewares/auth.middleware.js";
+import { authLimiter } from "../middlewares/rateLimit.js";
+import { uploadAvatar } from "../middlewares/multer.js";
 
 const router = express.Router();
 
-router.get("/profile", protect, getUserProfile);
-router.post("/register", upload.single("image"), register);
-router.post("/login", login);
-router.post("/logout", protect, logout);
-// router.post("/check-email", checkEmail);
+router.post("/register", authLimiter, uploadAvatar, register);
+router.post("/login", authLimiter, login);
+router.post("/logout", logout);
+router.get("/me", protect, me);
+router.put("/profile", protect, uploadAvatar, updateProfile);
 
 export default router;

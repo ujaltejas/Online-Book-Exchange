@@ -1,59 +1,29 @@
-// import jwt from "jsonwebtoken";
-// import User from "../models/user.model.js";
-
-// export const protect = async (req, res, next) => {
-//   let token = req.headers.authorization || req.header("x-auth-token");
-
-//   if (token && token.startsWith("Bearer ")) {
-//     token = token.split(" ")[1];
-//   } else if (!token) {
-//     return res.status(401).json({ message: "Not authorized, no token" });
-//   }
-
-//   try {
-//     // Verify the token
-//     const decoded = jwt.verify(
-//       token,
-//       process.env.JWT_SECRET || "default_secret"
-//     );
-
-//     // Attach user data (excluding password) to request object
-//     req.user = await User.findById(decoded.id).select("-password");
-
-//     next();
-//   } catch (error) {
-//     if (error.name === "TokenExpiredError") {
-//       return res
-//         .status(401)
-//         .json({ message: "Token expired, please login again" });
-//     }
-//     res.status(401).json({ message: "Invalid token" });
-//   }
-// };
-
-// // Correct ES Module Export
-// export default protect;
-
 import jwt from "jsonwebtoken";
 import User from "../models/user.model.js";
+import { env } from "../config/env.js";
+import { ApiError, asyncHandler } from "../utils/ApiError.js";
 
-const protect = async (req, res, next) => {
+export const protect = asyncHandler(async (req, _res, next) => {
+  const token = req.cookies?.token;
+  if (!token) throw new ApiError(401, "Please sign in to continue.");
+
+  let decoded;
   try {
-    const token = req.cookies.token;
-
-    if (!token) {
-      return res.status(401).json({ message: "Not authorized, no token" });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-
-    req.user = await User.findById(decoded.id).select("-password");
-
-    next();
-  } catch (error) {
-    console.log("error in auth middleware", error);
-    res.status(401).json({ message: "Invalid token" });
+    decoded = jwt.verify(token, env.JWT_SECRET);
+  } catch {
+    throw new ApiError(401, "Your session has expired. Please sign in again.");
   }
+
+  const user = await User.findById(decoded.id);
+  if (!user) throw new ApiError(401, "This account no longer exists.");
+
+  req.user = user;
+  next();
+});
+
+export const requireAdmin = (req, _res, next) => {
+  if (req.user?.role !== "admin") return next(new ApiError(403, "Administrator access required."));
+  next();
 };
 
 export default protect;

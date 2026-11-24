@@ -1,16 +1,12 @@
 {
-  "name": "bookexchange",
-  "version": "1.0.0",
-  "main": "index.js",
+  "name": "bookswap",
+  "private": true,
+  "description": "BookSwap: students swap or give away academic books.",
   "scripts": {
-    "dev": "concurrently \"cd client && npm run dev\" \"cd api && npm run dev\""
+    "install:all": "npm install && npm install --prefix api && npm install --prefix client",
+    "dev": "concurrently -n api,web -c green,yellow \"npm run dev --prefix api\" \"npm run dev --prefix client\""
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "concurrently": "^9.1.2",
-    "nodemailer": "^8.0.7"
+  "devDependencies": {
+    "concurrently": "^9.1.2"
   }
 }

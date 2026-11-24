@@ -1,169 +1,110 @@
 import bcrypt from "bcrypt";
 import User from "../models/user.model.js";
-import jwt from "jsonwebtoken";
-import generateToken from "../utils/jwt.js";
-import uploadImage from "../utils/cloudinary.js";
+import { ApiError, asyncHandler } from "../utils/ApiError.js";
+import { clean, isEmail, isString, normalizeEmail } from "../utils/validate.js";
+import { clearAuthCookie, setAuthCookie } from "../utils/jwt.js";
+import { deleteImages, uploadBuffer } from "../utils/cloudinary.js";
+import { publicUser } from "../utils/serializers.js";
 
+// Compared against when the email is unknown so response time does not reveal which emails exist.
+const DUMMY_HASH = await bcrypt.hash("not-a-real-password", 12);
 
-// Email validation regex
-const emailRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-
-export const register = async (req, res) => {
-  try {
-    const { username, email, password, role } = req.body;
-    console.log(req.body);
-    console.log(req.file);
-                              
-    if (!req?.file) {
-      return res.status(400).json({ message: "Image is required" });
-    }
-
-    // Validate email format
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ message: "Please provide a valid email address" });
-    }
-
-    const image = req.file.path;
-
-    const imageUrl = await uploadImage(image);
-
-    // Check if user already exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({ message: "User already exists" });
-    }
-
-    // Create new user
-    const newUser = new User({
-      username,
-      email,
-      password,
-      avatar: imageUrl,
-      role: role || "user", // Default role is 'user
-    });
-
-    await newUser.save();
-
-    // Generate JWT token
-    generateToken(newUser._id, newUser.role, res);
-
-    res.status(201).json({
-      message: "User registered successfully",
-      user: {
-        id: newUser._id,
-        username: newUser.username,
-        email: newUser.email,
-        avatar: newUser.avatar,
-        role: newUser.role,
-      },
-    });
-  } catch (error) {
-    console.error("Error during registration:", error); // Log error in console
-    res.status(500).json({ message: "Server error", error: error.message });
+const validatePassword = (password) => {
+  if (!isString(password) || password.length < 8) {
+    throw new ApiError(400, "Password must be at least 8 characters.");
   }
+  if (Buffer.byteLength(password) > 72) throw new ApiError(400, "Password must be 72 bytes or fewer.");
 };
 
-export const login = async (req, res) => {
-  try {
-    const { email, password } = req.body;
-    console.log(email, password);
+export const register = asyncHandler(async (req, res) => {
+  // `role` is deliberately never read from the request: accounts are always created as "user".
+  const username = clean(req.body.username, 40);
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
 
-    // Validate email format
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({ message: "Please provide a valid email address" });
-    }
+  if (username.length < 2) throw new ApiError(400, "Username must be at least 2 characters.");
+  if (!isEmail(email)) throw new ApiError(400, "Please enter a valid email address.");
+  validatePassword(password);
 
-    // Check if user exists
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
+  if (await User.exists({ email })) throw new ApiError(409, "An account with this email already exists.");
 
-    // Verify password
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ message: "Invalid credentials" });
-    }
-
-    generateToken(user._id, user.role, res);
-
-    res.status(200).json({
-      message: "Login successful",
-      user: {
-        id: user._id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-      },
-    });
-  } catch (error) {
-    console.error("Error during login:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
+  let avatar = "";
+  let avatarPublicId = "";
+  if (req.file) {
+    const up = await uploadBuffer(req.file.buffer, "bookswap/avatars");
+    avatar = up.url;
+    avatarPublicId = up.public_id;
   }
 
-  // dboperations
-};
-// Get User Profile (Protected)
-export const getUserProfile = async (req, res) => {
+  let user;
   try {
-    res.status(200).json(req.user);
-  } catch (error) {
-    res.status(500).json({ message: "Server error" });
+    user = await User.create({ username, email, password, avatar, avatarPublicId });
+  } catch (err) {
+    await deleteImages([avatarPublicId]);
+    throw err;
   }
+
+  setAuthCookie(res, user);
+  res.status(201).json({ user: publicUser(user) });
+});
+
+export const login = asyncHandler(async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  if (!isEmail(email) || !isString(password) || !password) {
+    throw new ApiError(400, "Enter your email and password.");
+  }
+
+  const user = await User.findOne({ email }).select("+password");
+  const ok = user ? await user.comparePassword(password) : await bcrypt.compare(password, DUMMY_HASH).then(() => false);
+  if (!user || !ok) throw new ApiError(401, "Email or password is incorrect.");
+
+  setAuthCookie(res, user);
+  res.json({ user: publicUser(user) });
+});
+
+// Public on purpose: signing out must work even when the session has already expired.
+export const logout = (_req, res) => {
+  clearAuthCookie(res);
+  res.json({ message: "Signed out." });
 };
 
-export const updateUserProfile = async (req, res) => {
+export const me = (req, res) => res.json({ user: publicUser(req.user) });
+
+export const updateProfile = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user._id).select("+avatarPublicId");
+  const username = clean(req.body.username, 40);
+  const email = normalizeEmail(req.body.email);
+
+  if (req.body.username !== undefined) {
+    if (username.length < 2) throw new ApiError(400, "Username must be at least 2 characters.");
+    user.username = username;
+  }
+  if (req.body.email !== undefined && email !== user.email) {
+    if (!isEmail(email)) throw new ApiError(400, "Please enter a valid email address.");
+    if (await User.exists({ email, _id: { $ne: user._id } })) {
+      throw new ApiError(409, "That email is already used by another account.");
+    }
+    user.email = email;
+  }
+
+  let oldAvatarId = "";
+  let newAvatarId = "";
+  if (req.file) {
+    const up = await uploadBuffer(req.file.buffer, "bookswap/avatars");
+    oldAvatarId = user.avatarPublicId;
+    newAvatarId = up.public_id;
+    user.avatar = up.url;
+    user.avatarPublicId = up.public_id;
+  }
+
   try {
-    let update = {};
-    const userId = req.user.id;
-    const { username, email } = req.body;
-    const avatar = req?.file?.path;
-    if (avatar) {
-      const imageUrl = await uploadImage(avatar);
-      update.avatar = imageUrl;
-    }
-
-    // Find user by ID
-    const user = await User.findById(userId);
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    if (username) {
-      update.username = username;
-    }
-
-    if (email) {
-      update.email = email;
-    }
-
-    // Update user fields
-    const updatedUser = await User.findByIdAndUpdate(
-      userId,
-      update,
-      { new: true, runValidators: true }
-    );
-
-    res.status(200).json({
-      message: "Profile updated successfully",
-      user: {
-        username: updatedUser.username,
-        email: updatedUser.email,
-        avatar: updatedUser.avatar,
-      },
-    });
-  } catch (error) {
-    res.status(500).json({ message: "Server error", error: error.message });
+    await user.save();
+  } catch (err) {
+    await deleteImages([newAvatarId]);
+    throw err;
   }
-};
+  await deleteImages([oldAvatarId]);
 
-export const logout = (req, res) => {
-  try {
-    res.clearCookie("token");
-
-    res.status(200).json({ message: "User logged out successfully" });
-  } catch (error) {
-    console.error("Error during logout:", error);
-    res.status(500).json({ message: "Server error", error: error.message });
-  }
-};
+  res.json({ user: publicUser(user) });
+});

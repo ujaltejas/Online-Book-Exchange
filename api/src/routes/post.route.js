@@ -1,34 +1,29 @@
 import express from "express";
-import protect from "../middlewares/auth.middleware.js";
-import upload from "../middlewares/multer.js";
+import { protect } from "../middlewares/auth.middleware.js";
+import { uploadBookImages } from "../middlewares/multer.js";
+import { contactLimiter } from "../middlewares/rateLimit.js";
 import {
+  contactBookOwner,
   createBook,
+  deleteBook,
   getAllBooks,
   getBookById,
+  getMyBooks,
+  setBookStatus,
   updateBook,
-  deleteBook,
-  getUserBooks,
-  manageBookImages,
-  contactBookOwner,
 } from "../controllers/book.controller.js";
 
 const router = express.Router();
 
 router.get("/", getAllBooks);
-
-router.get("/user", protect, getUserBooks);
-router.get("/user/:userId", protect, getUserBooks);
-
+router.get("/mine", protect, getMyBooks); // must stay above "/:id"
 router.get("/:id", getBookById);
 
-router.post("/", protect, upload.array("images", 10), createBook);
-
-router.put("/:id", protect, upload.array("images", 10), updateBook);
-
+router.post("/", protect, uploadBookImages, createBook);
+router.put("/:id", protect, uploadBookImages, updateBook);
+router.patch("/:id/status", protect, setBookStatus);
 router.delete("/:id", protect, deleteBook);
 
-router.patch("/:id/images", protect, upload.array("images", 10), manageBookImages);
-
-router.post("/:id/contact", contactBookOwner);
+router.post("/:id/contact", protect, contactLimiter, contactBookOwner);
 
 export default router;

@@ -1,78 +1,73 @@
-import { Navigate, Route, Routes } from "react-router-dom";
-import HomePage from "./routes/homePage/homePage.jsx";
-import ListPage from "./routes/listPage/listPage.jsx";
-import SinglePage from "./routes/singlePage/SinglePage.jsx";
-import Login from "./routes/login/login.jsx";
-import Register from "./routes/register/register.jsx";
-import About from "./routes/about/about.jsx";
-import AdminDashboard from "./pages/AdminDashboard.jsx";
+import { Suspense, lazy, useEffect } from "react";
+import { Navigate, Route, Routes, useParams } from "react-router-dom";
+import Layout from "./components/layout/Layout";
+import { GuestOnly, RequireAdmin, RequireAuth } from "./components/routing/RouteGuards";
+import { Spinner, Toaster } from "./components/ui/Feedback";
+import { useAuthStore } from "./store/useAuthStore";
+import Home from "./pages/Home";
+import Browse from "./pages/Browse";
+import BookDetail from "./pages/BookDetail";
+import Login from "./pages/Login";
+import Register from "./pages/Register";
+import Profile from "./pages/Profile";
+import AddBook from "./pages/AddBook";
+import EditBook from "./pages/EditBook";
+import About from "./pages/About";
+import NotFound from "./pages/NotFound";
 
-import { useEffect, useState } from "react";
-import useAuthStore from "./store/useAuthStore.js";
-import Profile from "./components/profile/Profile.jsx";
-import Navbar from "./components/navbar/Navbar.jsx";
-import AddBook from "./pages/AddBook.jsx";
-import BookView from "./pages/BookView.jsx";
-import EditBook from "./pages/EditBook.jsx";
+const Admin = lazy(() => import("./pages/Admin"));
 
-const App = () => {
-  const { checkAuth, user } = useAuthStore();
-  const [isLoading, setIsLoading] = useState(true);
+const Loading = () => (
+  <div className="grid min-h-[60vh] place-items-center text-lamp"><Spinner className="h-8 w-8" /></div>
+);
 
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        await checkAuth();
-      } catch (error) {
-        console.error("Auth check failed:", error);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    initAuth();
-  }, [checkAuth]);
-
-  if (isLoading) {
-    return (
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "center",
-          alignItems: "center",
-          height: "100vh",
-          fontSize: "1.2rem",
-        }}
-      >
-        Loading...
-      </div>
-    );
-  }
-
-  return (
-    <div>
-      <Navbar />
-      <Routes>
-        <Route path="/login" element={user ? <Navigate to="/" /> : <Login />} />
-        <Route path="/register" element={user ? <Navigate to="/" /> : <Register />} />
-
-        <Route path="/" element={<HomePage />} />
-        <Route path="/list" element={<ListPage />} />
-        <Route path="/about" element={<About />} />
-        <Route path="/profile" element={user ? <Profile /> : <Navigate to="/login" />} />
-        <Route path="/add-book" element={user ? <AddBook /> : <Navigate to="/login" />} />
-        <Route path="/edit-book/:id" element={user ? <EditBook /> : <Navigate to="/login" />} />
-        <Route path="/my-book/:id" element={user ? <BookView /> : <Navigate to="/login" />} />
-
-        <Route
-          path="/profile/admin"
-          element={user?.role === "admin" ? <AdminDashboard /> : <Navigate to="/" />}
-        />
-
-        <Route path="/:id" element={<SinglePage />} />
-      </Routes>
-    </div>
-  );
+// Old URLs from the previous version keep working.
+const LegacyBook = ({ suffix = "" }) => {
+  const { id } = useParams();
+  return <Navigate to={`/books/${id}${suffix}`} replace />;
 };
 
-export default App;
+export default function App() {
+  const ready = useAuthStore((s) => s.ready);
+  const checkAuth = useAuthStore((s) => s.checkAuth);
+  useEffect(() => {
+    checkAuth();
+  }, [checkAuth]);
+
+  if (!ready) return <Loading />;
+
+  return (
+    <>
+      <Routes>
+        <Route element={<GuestOnly />}>
+          <Route path="login" element={<Login />} />
+          <Route path="register" element={<Register />} />
+        </Route>
+
+        <Route element={<Layout />}>
+          <Route index element={<Home />} />
+          <Route path="books" element={<Browse />} />
+          <Route path="books/:id" element={<BookDetail />} />
+          <Route path="about" element={<About />} />
+
+          <Route element={<RequireAuth />}>
+            <Route path="profile" element={<Profile />} />
+            <Route path="add-book" element={<AddBook />} />
+            <Route path="books/:id/edit" element={<EditBook />} />
+          </Route>
+
+          <Route element={<RequireAdmin />}>
+            <Route path="admin" element={<Suspense fallback={<Loading />}><Admin /></Suspense>} />
+          </Route>
+
+          <Route path="list" element={<Navigate to="/books" replace />} />
+          <Route path="profile/admin" element={<Navigate to="/admin" replace />} />
+          <Route path="my-book/:id" element={<LegacyBook />} />
+          <Route path="edit-book/:id" element={<LegacyBook suffix="/edit" />} />
+          <Route path="*" element={<NotFound />} />
+        </Route>
+      </Routes>
+      <Toaster />
+    </>
+  );
+}

@@ -1,496 +1,226 @@
 import Book from "../models/book.model.js";
-import User from "../models/user.model.js";
-import uploadImage from "../utils/cloudinary.js";
-import sendEmail from "../utils/sendEmail.js";
+import ContactRequest from "../models/contactRequest.model.js";
+import { ApiError, asyncHandler } from "../utils/ApiError.js";
+import { CATEGORIES, CONDITIONS, EXCHANGE_TYPES, MAX_IMAGES, STATUSES, USER_BOOK_LIMIT } from "../utils/constants.js";
+import { clean, escapeRegex, isObjectId, isString, toInt } from "../utils/validate.js";
+import { deleteImages, uploadMany } from "../utils/cloudinary.js";
+import { publicBook } from "../utils/serializers.js";
+import { sendEmail } from "../utils/sendEmail.js";
+import { contactOwnerEmail } from "../utils/emailTemplates.js";
 
-const USER_BOOK_LIMIT = 20;
+const OWNER_FIELDS = "username avatar";
+const SORTS = { newest: "-createdAt", oldest: "createdAt", title: "title" };
 
-const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-export const createBook = async (req, res) => {
-  try {
-    const { title, author, category, condition, exchangeType, description, university, college } =
-      req.body;
-
-    if (req.user.role === "user") {
-      const userBookCount = await Book.countDocuments({ owner: req.user.id });
-      if (userBookCount >= USER_BOOK_LIMIT) {
-        return res.status(403).json({
-          success: false,
-          message: `Regular users can list up to ${USER_BOOK_LIMIT} books.`,
-        });
-      }
-    }
-
-    if (
-      !title ||
-      !author ||
-      !category ||
-      !condition ||
-      !exchangeType ||
-      !description ||
-      !university?.trim() ||
-      !college?.trim()
-    ) {
-      return res.status(400).json({ message: "Please provide all required fields" });
-    }
-
-    let images = [];
-    if (req.files && req.files.length > 0) {
-      const imagePromises = req.files.map((file) => uploadImage(file.path));
-      const imageUrls = await Promise.all(imagePromises);
-      images = imageUrls.map((url) => ({
-        url,
-        public_id: url.split("/").pop().split(".")[0],
-      }));
-    }
-
-    const newBook = new Book({
-      title,
-      author,
-      category,
-      condition,
-      exchangeType,
-      description,
-      university: university.trim(),
-      college: college.trim(),
-      images,
-      owner: req.user.id,
-    });
-
-    const savedBook = await newBook.save();
-
-    await User.findByIdAndUpdate(req.user.id, { $push: { listings: savedBook._id } });
-
-    res.status(201).json({
-      success: true,
-      book: savedBook,
-    });
-  } catch (error) {
-    console.error("Error creating book:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error creating book",
-      error: error.message,
-    });
-  }
+const TEXT_RULES = {
+  title: { label: "Title", min: 2, max: 150 },
+  author: { label: "Author", min: 2, max: 120 },
+  description: { label: "Description", min: 10, max: 2000 },
+  university: { label: "University", min: 2, max: 120 },
+  college: { label: "College", min: 2, max: 120 },
+};
+const ENUM_RULES = {
+  category: { label: "Category", values: CATEGORIES },
+  condition: { label: "Condition", values: CONDITIONS },
+  exchangeType: { label: "Listing type", values: EXCHANGE_TYPES },
 };
 
-export const getAllBooks = async (req, res) => {
+/** Validate book fields. With partial=true only the provided fields are checked. */
+const parseBookFields = (body, { partial }) => {
+  const out = {};
+  for (const [key, { label, min, max }] of Object.entries(TEXT_RULES)) {
+    if (body[key] === undefined) {
+      if (!partial) throw new ApiError(400, `${label} is required.`);
+      continue;
+    }
+    const value = clean(body[key], max + 1);
+    if (value.length < min) throw new ApiError(400, `${label} must be at least ${min} characters.`);
+    if (value.length > max) throw new ApiError(400, `${label} must be ${max} characters or fewer.`);
+    out[key] = value;
+  }
+  for (const [key, { label, values }] of Object.entries(ENUM_RULES)) {
+    if (body[key] === undefined) {
+      if (!partial) throw new ApiError(400, `${label} is required.`);
+      continue;
+    }
+    if (!isString(body[key]) || !values.includes(body[key])) throw new ApiError(400, `${label} is not valid.`);
+    out[key] = body[key];
+  }
+  return out;
+};
+
+const findOwnedBook = async (req) => {
+  if (!isObjectId(req.params.id)) throw new ApiError(404, "Book not found.");
+  const book = await Book.findById(req.params.id);
+  if (!book) throw new ApiError(404, "Book not found.");
+  const isOwner = String(book.owner) === String(req.user._id);
+  if (!isOwner && req.user.role !== "admin") throw new ApiError(403, "You can only change your own listings.");
+  return book;
+};
+
+export const createBook = asyncHandler(async (req, res) => {
+  if (req.user.role === "user") {
+    const count = await Book.countDocuments({ owner: req.user._id });
+    if (count >= USER_BOOK_LIMIT) {
+      throw new ApiError(403, `You can list up to ${USER_BOOK_LIMIT} books. Remove one to add another.`);
+    }
+  }
+
+  const fields = parseBookFields(req.body, { partial: false });
+  const images = await uploadMany(req.files || [], "bookswap/books");
+
+  let book;
   try {
-    const {
-      category,
-      condition,
-      exchangeType,
-      q,
-      university,
-      college,
-      excludeOwner,
-      sort = "-createdAt",
-    } = req.query;
+    book = await Book.create({ ...fields, images, owner: req.user._id });
+  } catch (err) {
+    await deleteImages(images.map((i) => i.public_id));
+    throw err;
+  }
+  await book.populate("owner", OWNER_FIELDS);
+  res.status(201).json({ book: publicBook(book) });
+});
 
-    const query = {};
-    const andParts = [];
+export const getAllBooks = asyncHandler(async (req, res) => {
+  const q = clean(req.query.q, 100);
+  const university = clean(req.query.university, 100);
+  const college = clean(req.query.college, 100);
+  const filter = {};
 
-    if (excludeOwner) {
-      query.owner = { $ne: excludeOwner };
-    }
-    if (category) query.category = category;
-    if (condition) query.condition = condition;
-    if (exchangeType) query.exchangeType = exchangeType;
+  // Only plain strings from the allow-lists reach the query, which blocks operator injection like ?category[$ne]=x
+  for (const [key, { values }] of Object.entries(ENUM_RULES)) {
+    if (isString(req.query[key]) && values.includes(req.query[key])) filter[key] = req.query[key];
+  }
+  if (isString(req.query.status) && STATUSES.includes(req.query.status)) filter.status = req.query.status;
+  if (isObjectId(req.query.excludeOwner)) filter.owner = { $ne: req.query.excludeOwner };
 
-    if (university && university.trim()) {
-      andParts.push({
-        university: new RegExp(escapeRegex(university.trim()), "i"),
-      });
-    }
-    if (college && college.trim()) {
-      andParts.push({
-        college: new RegExp(escapeRegex(college.trim()), "i"),
-      });
-    }
-    if (q && q.trim()) {
-      const rx = new RegExp(escapeRegex(q.trim()), "i");
-      andParts.push({
-        $or: [{ title: rx }, { author: rx }, { university: rx }, { college: rx }],
-      });
-    }
+  const and = [];
+  if (university) and.push({ university: new RegExp(escapeRegex(university), "i") });
+  if (college) and.push({ college: new RegExp(escapeRegex(college), "i") });
+  if (q) {
+    const rx = new RegExp(escapeRegex(q), "i");
+    and.push({ $or: [{ title: rx }, { author: rx }, { university: rx }, { college: rx }] });
+  }
+  if (and.length) filter.$and = and;
 
-    if (andParts.length > 0) {
-      query.$and = andParts;
-    }
+  const page = toInt(req.query.page, 1, 1, 10_000);
+  const limit = toInt(req.query.limit, 12, 1, 50);
+  const sort = SORTS[req.query.sort] || SORTS.newest;
 
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 50;
-    const skip = (page - 1) * limit;
-
-    const books = await Book.find(query)
-      .populate("owner", "username email avatar")
+  const [books, total] = await Promise.all([
+    Book.find(filter)
+      .populate("owner", OWNER_FIELDS)
       .sort(sort)
-      .skip(skip)
-      .limit(limit);
+      .skip((page - 1) * limit)
+      .limit(limit),
+    Book.countDocuments(filter),
+  ]);
 
-    const total = await Book.countDocuments(query);
+  res.json({ books: books.map(publicBook), total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) });
+});
 
-    res.status(200).json({
-      success: true,
-      count: books.length,
-      total,
-      totalPages: Math.ceil(total / limit),
-      currentPage: page,
-      books,
-    });
-  } catch (error) {
-    console.error("Error fetching books:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching books",
-      error: error.message,
-    });
+export const getBookById = asyncHandler(async (req, res) => {
+  if (!isObjectId(req.params.id)) throw new ApiError(404, "Book not found.");
+  const book = await Book.findById(req.params.id).populate("owner", OWNER_FIELDS);
+  if (!book) throw new ApiError(404, "Book not found.");
+  res.json({ book: publicBook(book) });
+});
+
+export const getMyBooks = asyncHandler(async (req, res) => {
+  const books = await Book.find({ owner: req.user._id }).populate("owner", OWNER_FIELDS).sort("-createdAt");
+  res.json({ books: books.map(publicBook), limit: req.user.role === "user" ? USER_BOOK_LIMIT : null });
+});
+
+export const updateBook = asyncHandler(async (req, res) => {
+  const book = await findOwnedBook(req);
+  const fields = parseBookFields(req.body, { partial: true });
+
+  let removeIds = [];
+  if (req.body.removedImages) {
+    try {
+      const parsed = JSON.parse(req.body.removedImages);
+      if (Array.isArray(parsed)) removeIds = parsed.map(String);
+    } catch {
+      throw new ApiError(400, "removedImages must be valid JSON.");
+    }
   }
-};
+  const toRemove = book.images.filter((img) => removeIds.includes(String(img._id)));
+  const kept = book.images.filter((img) => !removeIds.includes(String(img._id)));
+  const files = req.files || [];
+  if (kept.length + files.length > MAX_IMAGES) {
+    throw new ApiError(400, `A listing can have up to ${MAX_IMAGES} photos.`);
+  }
 
-export const getBookById = async (req, res) => {
+  const uploaded = await uploadMany(files, "bookswap/books");
   try {
-    const book = await Book.findById(req.params.id).populate(
-      "owner",
-      "username email avatar role"
-    );
-
-    if (!book) {
-      return res.status(404).json({
-        success: false,
-        message: "Book not found",
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      book,
-    });
-  } catch (error) {
-    console.error("Error fetching book:", error);
-    if (error.kind === "ObjectId") {
-      return res.status(404).json({
-        success: false,
-        message: "Book not found",
-      });
-    }
-    res.status(500).json({
-      success: false,
-      message: "Error fetching book",
-      error: error.message,
-    });
+    book.set(fields);
+    book.images = [...kept, ...uploaded];
+    await book.save();
+  } catch (err) {
+    await deleteImages(uploaded.map((i) => i.public_id));
+    throw err;
   }
-};
+  await deleteImages(toRemove.map((i) => i.public_id));
 
-export const updateBook = async (req, res) => {
+  await book.populate("owner", OWNER_FIELDS);
+  res.json({ book: publicBook(book) });
+});
+
+export const setBookStatus = asyncHandler(async (req, res) => {
+  const book = await findOwnedBook(req);
+  if (!isString(req.body.status) || !STATUSES.includes(req.body.status)) {
+    throw new ApiError(400, "Status must be available, reserved or exchanged.");
+  }
+  book.status = req.body.status;
+  await book.save();
+  await book.populate("owner", OWNER_FIELDS);
+  res.json({ book: publicBook(book) });
+});
+
+export const deleteBook = asyncHandler(async (req, res) => {
+  const book = await findOwnedBook(req);
+  await deleteImages(book.images.map((i) => i.public_id));
+  await ContactRequest.deleteMany({ book: book._id });
+  await book.deleteOne();
+  res.json({ message: "Listing deleted." });
+});
+
+export const contactBookOwner = asyncHandler(async (req, res) => {
+  if (!isObjectId(req.params.id)) throw new ApiError(404, "Book not found.");
+  const message = clean(req.body.message, 1000);
+  const phone = clean(req.body.phone, 30);
+  if (message.length < 10) throw new ApiError(400, "Write a message of at least 10 characters.");
+  if (phone && !/^[+\d][\d\s()-]{5,}$/.test(phone)) throw new ApiError(400, "Enter a valid phone number or leave it empty.");
+
+  const book = await Book.findById(req.params.id).populate("owner", "username email");
+  if (!book || !book.owner) throw new ApiError(404, "Book not found.");
+  if (String(book.owner._id) === String(req.user._id)) throw new ApiError(400, "This is your own listing.");
+  if (book.status === "exchanged") throw new ApiError(409, "This book has already been exchanged.");
+
+  const recent = await ContactRequest.exists({
+    book: book._id,
+    requester: req.user._id,
+    createdAt: { $gte: new Date(Date.now() - 10 * 60 * 1000) },
+  });
+  if (recent) throw new ApiError(429, "You already messaged this owner a moment ago. Give them a few minutes to reply.");
+
+  const request = await ContactRequest.create({
+    book: book._id,
+    requester: req.user._id,
+    owner: book.owner._id,
+    message,
+    phone,
+  });
+
+  const mail = contactOwnerEmail({ owner: book.owner, book, requester: req.user, phone, message });
   try {
-    const bookId = req.params.id;
-    let book = await Book.findById(bookId);
-
-    if (!book) {
-      return res.status(404).json({
-        success: false,
-        message: "Book not found",
-      });
-    }
-
-    if (book.owner.toString() !== req.user.id && req.user.role !== "admin") {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized to update this book",
-      });
-    }
-
-    let newImages = [];
-    if (req.files && req.files.length > 0) {
-      const imagePromises = req.files.map((file) => uploadImage(file.path));
-      const imageUrls = await Promise.all(imagePromises);
-      newImages = imageUrls.map((url) => ({
-        url,
-        public_id: url.split("/").pop().split(".")[0],
-      }));
-    }
-
-    let currentImages = [...(book.images || [])];
-    if (req.body.removedImages) {
-      const removedImageIds = JSON.parse(req.body.removedImages);
-      currentImages = currentImages.filter(
-        (img) => !removedImageIds.includes(img._id.toString())
-      );
-    }
-
-    const allowed = [
-      "title",
-      "author",
-      "category",
-      "condition",
-      "exchangeType",
-      "description",
-      "university",
-      "college",
-    ];
-    const updateData = {};
-    for (const key of allowed) {
-      if (req.body[key] !== undefined && req.body[key] !== "") {
-        const v = req.body[key];
-        updateData[key] =
-          key === "university" || key === "college" ? String(v).trim() : v;
-      }
-    }
-    updateData.images = [...currentImages, ...newImages];
-
-    const updatedBook = await Book.findByIdAndUpdate(bookId, updateData, {
-      new: true,
-      runValidators: true,
-    }).populate("owner", "username email avatar");
-
-    res.status(200).json({
-      success: true,
-      book: updatedBook,
-    });
-  } catch (error) {
-    console.error("Error updating book:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error updating book",
-      error: error.message,
-    });
+    await sendEmail({ to: book.owner.email, replyTo: req.user.email, ...mail });
+    request.emailStatus = "sent";
+    await request.save();
+  } catch (err) {
+    console.error("[contact] email failed:", err.message);
+    request.emailStatus = "failed";
+    await request.save();
+    throw new ApiError(502, "We could not deliver your message right now. Please try again later.");
   }
-};
 
-export const deleteBook = async (req, res) => {
-  try {
-    const bookId = req.params.id;
-    const book = await Book.findById(bookId);
-
-    if (!book) {
-      return res.status(404).json({
-        success: false,
-        message: "Book not found",
-      });
-    }
-
-    if (book.owner.toString() !== req.user.id && req.user.role !== "admin") {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized to delete this book",
-      });
-    }
-
-    await User.findByIdAndUpdate(book.owner, { $pull: { listings: bookId } });
-    await Book.findByIdAndDelete(bookId);
-
-    res.status(200).json({
-      success: true,
-      message: "Book deleted successfully",
-    });
-  } catch (error) {
-    console.error("Error deleting book:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error deleting book",
-      error: error.message,
-    });
-  }
-};
-
-export const getUserBooks = async (req, res) => {
-  try {
-    const userId = req.params.userId || req.query.userId || req.user.id;
-
-    const books = await Book.find({ owner: userId }).sort("-createdAt");
-
-    res.status(200).json({
-      success: true,
-      count: books.length,
-      books,
-    });
-  } catch (error) {
-    console.error("Error fetching user books:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching user books",
-      error: error.message,
-    });
-  }
-};
-
-export const manageBookImages = async (req, res) => {
-  try {
-    const { id: bookId } = req.params;
-    const { action } = req.query;
-
-    if (!["add", "remove"].includes(action)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid action. Use 'add' or 'remove'",
-      });
-    }
-
-    const book = await Book.findById(bookId);
-
-    if (!book) {
-      return res.status(404).json({
-        success: false,
-        message: "Book not found",
-      });
-    }
-
-    if (book.owner.toString() !== req.user.id && req.user.role !== "admin") {
-      return res.status(403).json({
-        success: false,
-        message: "Not authorized to modify this book",
-      });
-    }
-
-    if (action === "add") {
-      if (!req.files || req.files.length === 0) {
-        return res.status(400).json({
-          success: false,
-          message: "No images provided",
-        });
-      }
-
-      const imagePromises = req.files.map((file) => uploadImage(file.path));
-      const imageUrls = await Promise.all(imagePromises);
-      const newImages = imageUrls.map((url) => ({
-        url,
-        public_id: url.split("/").pop().split(".")[0],
-      }));
-
-      const updatedBook = await Book.findByIdAndUpdate(
-        bookId,
-        { $push: { images: { $each: newImages } } },
-        { new: true }
-      );
-
-      return res.status(200).json({
-        success: true,
-        message: "Images added successfully",
-        book: updatedBook,
-      });
-    }
-
-    const { imageId } = req.body;
-    if (!imageId) {
-      return res.status(400).json({
-        success: false,
-        message: "Image ID is required",
-      });
-    }
-
-    const updatedBook = await Book.findByIdAndUpdate(
-      bookId,
-      { $pull: { images: { public_id: imageId } } },
-      { new: true }
-    );
-
-    return res.status(200).json({
-      success: true,
-      message: "Image removed successfully",
-      book: updatedBook,
-    });
-  } catch (error) {
-    console.error("Error managing book images:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error managing book images",
-      error: error.message,
-    });
-  }
-};
-
-const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-const escapeHtml = (value = "") =>
-  String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-
-export const contactBookOwner = async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { name, email, phone, message } = req.body;
-
-    if (!name?.trim() || !email?.trim() || !message?.trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Name, email and message are required",
-      });
-    }
-
-    if (!emailRegex.test(email)) {
-      return res.status(400).json({
-        success: false,
-        message: "Please provide a valid email address",
-      });
-    }
-
-    const book = await Book.findById(id).populate("owner", "email username");
-
-    if (!book) {
-      return res.status(404).json({
-        success: false,
-        message: "Book not found",
-      });
-    }
-
-    if (!book.owner?.email) {
-      return res.status(400).json({
-        success: false,
-        message: "Book owner email is not available",
-      });
-    }
-
-    await sendEmail({
-      to: book.owner.email,
-      replyTo: email,
-      subject: `Interest in your book: ${book.title}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #222;">
-          <h2>Someone wants to contact you about your book</h2>
-          <p>Hello ${escapeHtml(book.owner.username || "Book Owner")},</p>
-          <p>A user is interested in your listing on Online Book Exchange.</p>
-
-          <h3>Book Details</h3>
-          <p><strong>Title:</strong> ${escapeHtml(book.title)}</p>
-          <p><strong>Author:</strong> ${escapeHtml(book.author)}</p>
-          <p><strong>Category:</strong> ${escapeHtml(book.category)}</p>
-          <p><strong>Condition:</strong> ${escapeHtml(book.condition)}</p>
-          <p><strong>University:</strong> ${escapeHtml(book.university || "-")}</p>
-          <p><strong>College:</strong> ${escapeHtml(book.college || "-")}</p>
-          <p><strong>Listing Type:</strong> ${book.exchangeType === "free" ? "Free / Donation" : "Exchange"}</p>
-
-          <h3>Interested User Details</h3>
-          <p><strong>Name:</strong> ${escapeHtml(name)}</p>
-          <p><strong>Email:</strong> ${escapeHtml(email)}</p>
-          <p><strong>Phone:</strong> ${escapeHtml(phone || "Not provided")}</p>
-
-          <h3>Message</h3>
-          <p>${escapeHtml(message).replace(/\n/g, "<br />")}</p>
-
-          <hr />
-          <p>You can reply directly to this email to continue the exchange offline.</p>
-          <p><em>No payment is processed by the platform.</em></p>
-        </div>
-      `,
-    });
-
-    return res.status(200).json({
-      success: true,
-      message: "Email sent successfully to the book owner",
-    });
-  } catch (error) {
-    console.error("Error sending email:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Error sending email",
-      error: error.message,
-    });
-  }
-};
+  res.json({ message: `Message sent to ${book.owner.username}. They can reply to your email.` });
+});

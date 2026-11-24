@@ -1,66 +1,41 @@
-import cloudinary from "cloudinary";
-import fs from "fs";
+import { v2 as cloudinary } from "cloudinary";
+import { env, isCloudinaryConfigured } from "../config/env.js";
+import { ApiError } from "./ApiError.js";
 
-cloudinary.config({
-  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-  api_key: process.env.CLOUDINARY_API_KEY,
-  api_secret: process.env.CLOUDINARY_API_SECRET,
-});
+cloudinary.config({ ...env.CLOUDINARY, secure: true });
 
-const uploadImage = async (file) => {
-  try {
-    const result = await cloudinary.uploader.upload(file, {
-      resource_type: "auto",
-    });
-    fs.unlinkSync(file);
-    return result.secure_url;
-  } catch (error) {
-    console.log("error in cloudinary", error);
-    fs.unlinkSync(file);
+/** Upload an in-memory image buffer. Nothing is written to local disk. */
+export const uploadBuffer = (buffer, folder) =>
+  new Promise((resolve, reject) => {
+    if (!isCloudinaryConfigured()) {
+      return reject(new ApiError(503, "Image uploads are not configured on this server."));
+    }
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder,
+        resource_type: "image",
+        transformation: [{ width: 1600, height: 1600, crop: "limit", quality: "auto" }],
+      },
+      (err, result) => (err ? reject(err) : resolve({ url: result.secure_url, public_id: result.public_id }))
+    );
+    stream.end(buffer);
+  });
+
+/** Upload several files; if any fail, remove the ones that succeeded. */
+export const uploadMany = async (files, folder) => {
+  const results = await Promise.allSettled(files.map((f) => uploadBuffer(f.buffer, folder)));
+  const ok = results.filter((r) => r.status === "fulfilled").map((r) => r.value);
+  if (ok.length !== files.length) {
+    await deleteImages(ok.map((i) => i.public_id));
+    const apiErr = results.find((r) => r.status === "rejected" && r.reason instanceof ApiError);
+    throw apiErr ? apiErr.reason : new ApiError(502, "Image upload failed. Please try again.");
   }
+  return ok;
 };
 
-export default uploadImage;
-
-// import { v2 as cloudinary } from "cloudinary";
-
-// (async function () {
-//   // Configuration
-//   cloudinary.config({
-//     cloud_name: "dcxu367zg",
-//     api_key: "192186788824314",
-//     api_secret: "<your_api_secret>", // Click 'View API Keys' above to copy your API secret
-//   });
-
-//   // Upload an image
-//   const uploadResult = await cloudinary.uploader
-//     .upload(
-//       "https://res.cloudinary.com/demo/image/upload/getting-started/shoes.jpg",
-//       {
-//         public_id: "shoes",
-//       }
-//     )
-//     .catch((error) => {
-//       console.log(error);
-//     });
-
-//   console.log(uploadResult);
-
-//   // Optimize delivery by resizing and applying auto-format and auto-quality
-//   const optimizeUrl = cloudinary.url("shoes", {
-//     fetch_format: "auto",
-//     quality: "auto",
-//   });
-
-//   console.log(optimizeUrl);
-
-//   // Transform the image: auto-crop to square aspect_ratio
-//   const autoCropUrl = cloudinary.url("shoes", {
-//     crop: "auto",
-//     gravity: "auto",
-//     width: 500,
-//     height: 500,
-//   });
-
-//   console.log(autoCropUrl);
-// })();
+/** Best-effort cleanup. Never throws. */
+export const deleteImages = async (publicIds = []) => {
+  const ids = publicIds.filter(Boolean);
+  if (!ids.length || !isCloudinaryConfigured()) return;
+  await Promise.allSettled(ids.map((id) => cloudinary.uploader.destroy(id)));
+};

@@ -1,15 +1,76 @@
 @import "tailwindcss";
 
-* {
-  box-sizing: border-box;
+@theme {
+  --font-sans: "Bricolage Grotesque", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Literata", Georgia, "Times New Roman", serif;
+
+  --color-paper: #f2f5f2;
+  --color-ink: #15281f;
+  --color-ink-soft: #4a5b52;
+  --color-line: #d3dcd5;
+  --color-lamp: #1f5c47;
+  --color-lamp-deep: #143d30;
+  --color-lamp-tint: #e3ece6;
+  --color-brass: #c79a2e;
+  --color-brass-deep: #8a6612;
+  --color-danger: #b3362b;
+  --color-danger-tint: #f7e4e1;
 }
 
-body {
-  margin: 0;
-  font-family: "Lato", sans-serif;
+@layer base {
+  html { scroll-behavior: smooth; }
+  body {
+    @apply bg-paper font-sans text-ink antialiased;
+    font-optical-sizing: auto;
+  }
+  h1, h2, h3, h4 { @apply font-sans tracking-tight text-balance; }
+  :focus-visible { outline: 2px solid var(--color-brass); outline-offset: 2px; }
+  ::selection { background: var(--color-brass); color: var(--color-ink); }
 }
 
-a {
-  text-decoration: none;
-  color: inherit;
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-md px-4 py-2.5 text-sm font-semibold
+      transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-sm { @apply px-3 py-1.5 text-[13px]; }
+  .btn-primary { @apply bg-lamp text-white hover:bg-lamp-deep; }
+  .btn-brass { @apply bg-brass text-ink hover:bg-[#d6a937]; }
+  .btn-ghost { @apply border border-line bg-white text-ink hover:border-ink; }
+  .btn-danger { @apply bg-danger text-white hover:bg-[#962c23]; }
+  .btn-quiet { @apply text-ink-soft hover:bg-lamp-tint hover:text-ink; }
+
+  .label { @apply mb-1.5 block text-sm font-medium text-ink; }
+  .hint { @apply mt-1.5 text-[13px] text-ink-soft; }
+  .field-error { @apply mt-1.5 text-[13px] font-medium text-danger; }
+  .input {
+    @apply w-full rounded-md border border-line bg-white px-3 py-2.5 text-[15px] text-ink
+      placeholder:text-ink-soft/60 focus:border-lamp focus:outline-none focus:ring-2 focus:ring-lamp/25
+      disabled:bg-paper disabled:text-ink-soft;
+  }
+  .input[aria-invalid="true"] { @apply border-danger focus:border-danger focus:ring-danger/20; }
+
+  .page { @apply mx-auto w-full max-w-6xl px-5 sm:px-8; }
+  .reading { @apply font-serif text-[16.5px] leading-[1.75] text-ink; }
+}
+
+/* The one orchestrated moment: books are slid onto the shelf once when the page loads. */
+@keyframes shelve {
+  from { opacity: 0; transform: translateY(32px); }
+  to { opacity: 1; transform: none; }
+}
+.spine { animation: shelve 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both; animation-delay: calc(var(--i, 0) * 80ms); }
+.spine-pull { transition: transform 0.2s ease; }
+.spine-pull:hover, .spine-pull:focus-visible { transform: translateY(-14px); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.toast { animation: toast-in 0.2s ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .spine, .toast { animation: none; }
+  .spine-pull { transition: none; }
 }
